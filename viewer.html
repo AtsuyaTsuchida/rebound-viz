@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REBOUND N-body viewer</title>
+<style>
+  :root { --fg:#cfe3ff; --dim:#6b7da0; --accent:#5fd0ff; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#05070d; overflow:hidden;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--fg); }
+  #app { position:fixed; inset:0; }
+  #hud { position:fixed; left:16px; top:14px; z-index:10; font-size:12px;
+    line-height:1.5; pointer-events:none; text-shadow:0 0 8px #000; }
+  #hud .k { color: var(--dim); }
+  #hud .v { color: var(--accent); }
+  #panel { position:fixed; left:16px; bottom:16px; right:16px; z-index:10;
+    display:flex; align-items:center; gap:14px; padding:10px 14px;
+    background:rgba(10,16,28,.72); backdrop-filter: blur(8px);
+    border:1px solid rgba(95,208,255,.18); border-radius:12px; font-size:12px; }
+  button { font:inherit; color:var(--fg); background:rgba(95,208,255,.12);
+    border:1px solid rgba(95,208,255,.35); border-radius:7px; padding:6px 12px;
+    cursor:pointer; transition:.15s; }
+  button:hover { background:rgba(95,208,255,.28); }
+  select { font:inherit; color:var(--fg); background:#0a1018;
+    border:1px solid rgba(95,208,255,.35); border-radius:7px; padding:5px 8px; }
+  input[type=range] { flex:1; accent-color: var(--accent); }
+  .grp { display:flex; align-items:center; gap:7px; white-space:nowrap; }
+  .grp label { color:var(--dim); }
+  #time { color:var(--accent); min-width:104px; text-align:right; }
+  #err { position:fixed; inset:0; display:none; place-items:center; z-index:20;
+    background:rgba(5,7,13,.92); text-align:center; padding:40px; }
+  #err code { color:var(--accent); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">
+  <div><span class="k">system </span><span class="v" id="hud-sys">—</span></div>
+  <div><span class="k">bodies </span><span class="v" id="hud-n">—</span></div>
+  <div><span class="k">drag</span> rotate · <span class="k">scroll</span> zoom · <span class="k">space</span> play/pause</div>
+</div>
+<div id="panel">
+  <button id="play">⏸ pause</button>
+  <div class="grp"><label>system</label>
+    <select id="sys">
+      <option value="chaos3">chaos3</option>
+      <option value="figure8">figure8</option>
+      <option value="cluster">cluster</option>
+    </select>
+  </div>
+  <div class="grp"><label>trail</label>
+    <input id="trail" type="range" min="20" max="800" value="240" style="flex:none;width:90px">
+  </div>
+  <div class="grp"><label>speed</label>
+    <input id="speed" type="range" min="0.1" max="4" step="0.1" value="1" style="flex:none;width:90px">
+  </div>
+  <input id="scrub" type="range" min="0" max="1000" value="0">
+  <div id="time">0 / 0</div>
+</div>
+<div id="err"><div>
+  <p>trajectories.json が読めませんでした。</p>
+  <p>ローカルサーバ経由で開いてね:</p>
+  <p><code>cd ~/dev/rebound-viz &amp;&amp; ./venv/bin/python -m http.server 8000</code></p>
+  <p>→ <code>http://localhost:8000/viewer.html</code></p>
+</div></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05070d, 0.012);
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.01, 5000);
+camera.position.set(0, 4, 9);
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.dampingFactor = 0.06;
+
+// 控えめな星空背景
+(function starfield(){
+  const N = 1500, g = new THREE.BufferGeometry(), pos = new Float32Array(N*3);
+  for (let i=0;i<N*3;i++) pos[i] = (Math.random()-0.5)*400;
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  const m = new THREE.PointsMaterial({ size:0.6, color:0x223049, sizeAttenuation:true });
+  scene.add(new THREE.Points(g, m));
+})();
+
+// --- 状態 ---
+let DATA=null, nbody=0, frames=0, scale=1;
+let bodies=[], trails=[], trailGeoms=[];
+let frame=0, playing=true, trailLen=240, speed=1;
+const COLORS = [0x5fd0ff, 0xff7a6b, 0xffe26b, 0x9d8bff, 0x6bffb0, 0xff8bd0,
+                0x8bd0ff, 0xffb36b, 0xb0ff6b, 0xd06bff];
+
+const $ = id => document.getElementById(id);
+
+function clearScene(){
+  for (const o of [...bodies, ...trails]) { scene.remove(o);
+    o.geometry?.dispose(); o.material?.dispose(); }
+  bodies=[]; trails=[]; trailGeoms=[];
+}
+
+function posAt(f, j, out){
+  // フラット配列 frame-major: ((f*nbody)+j)*3
+  const base = ((f*nbody)+j)*3, P = DATA.positions;
+  out.set(P[base]/scale, P[base+1]/scale, P[base+2]/scale);
+}
+
+function build(){
+  clearScene();
+  nbody = DATA.nbody; frames = DATA.frames;
+  scale = DATA.span / 4.0;            // span を画面 ~4 単位に正規化
+  $('hud-sys').textContent = DATA.system;
+  $('hud-n').textContent = nbody;
+  $('scrub').max = frames-1;
+
+  const maxM = Math.max(...DATA.masses);
+  const tmp = new THREE.Vector3();
+  for (let j=0;j<nbody;j++){
+    const col = COLORS[j % COLORS.length];
+    // サイズは質量の立方根スケール
+    const r = 0.06 + 0.22*Math.cbrt(DATA.masses[j]/maxM);
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(r, 24, 18),
+      new THREE.MeshBasicMaterial({ color: col }));
+    // ふわっと光るハロー
+    const halo = new THREE.Mesh(
+      new THREE.SphereGeometry(r*2.6, 20, 14),
+      new THREE.MeshBasicMaterial({ color: col, transparent:true,
+        opacity:0.12, depthWrite:false }));
+    mesh.add(halo);
+    posAt(0, j, tmp); mesh.position.copy(tmp);
+    scene.add(mesh); bodies.push(mesh);
+
+    // トレイル（事前確保したラインを部分描画）
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(1024*3),3));
+    g.setDrawRange(0,0);
+    const line = new THREE.Line(g, new THREE.LineBasicMaterial({
+      color: col, transparent:true, opacity:0.55 }));
+    scene.add(line); trails.push(line); trailGeoms.push(g);
+  }
+}
+
+function updateTrails(){
+  const tmp = new THREE.Vector3();
+  for (let j=0;j<nbody;j++){
+    const g = trailGeoms[j], arr = g.attributes.position.array;
+    const start = Math.max(0, frame - trailLen);
+    let k=0;
+    for (let f=start; f<=frame; f++){ posAt(f, j, tmp);
+      arr[k++]=tmp.x; arr[k++]=tmp.y; arr[k++]=tmp.z; }
+    g.setDrawRange(0, frame-start+1);
+    g.attributes.position.needsUpdate = true;
+    g.computeBoundingSphere();
+  }
+}
+
+function showFrame(f){
+  frame = Math.max(0, Math.min(frames-1, f|0));
+  const tmp = new THREE.Vector3();
+  for (let j=0;j<nbody;j++){ posAt(frame, j, tmp); bodies[j].position.copy(tmp); }
+  updateTrails();
+  $('scrub').value = frame;
+  $('time').textContent = `${frame} / ${frames-1}`;
+}
+
+async function load(system){
+  const url = `traj_${system}.json`;
+  let res;
+  try { res = await fetch(url); if(!res.ok) throw 0; DATA = await res.json(); }
+  catch(e){ $('err').querySelector('p').textContent =
+    `traj_${system}.json が読めませんでした。`; $('err').style.display='grid'; return; }
+  $('err').style.display='none';
+  build(); showFrame(0); playing=true; $('play').textContent='⏸ pause';
+}
+
+// --- UI ---
+$('play').onclick = () => { playing=!playing;
+  $('play').textContent = playing ? '⏸ pause' : '▶ play'; };
+$('scrub').oninput = e => { playing=false; $('play').textContent='▶ play';
+  showFrame(+e.target.value); };
+$('trail').oninput = e => { trailLen=+e.target.value; updateTrails(); };
+$('speed').oninput = e => { speed=+e.target.value; };
+$('sys').onchange = e => load(e.target.value);
+addEventListener('keydown', e => { if(e.code==='Space'){ e.preventDefault();
+  $('play').click(); }});
+addEventListener('resize', () => { camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// --- ループ ---
+let acc=0;
+function tick(){
+  requestAnimationFrame(tick);
+  if (DATA && playing){ acc += speed;
+    if (acc >= 1){ const adv = acc|0; acc -= adv;
+      let nf = frame + adv; if (nf >= frames) nf = 0;  // ループ再生
+      showFrame(nf); } }
+  orbit.update();
+  renderer.render(scene, camera);
+}
+tick();
+load('chaos3');
+</script>
+</body>
+</html>
